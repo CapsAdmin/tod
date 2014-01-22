@@ -4,7 +4,7 @@ local night =
 {	
 	["sun_angles"] = Angle(-90, 45, 0),
 	["moon_angles"] = -Angle(-90, 45, 0),
-	["world_light_multiplier"] = 0.53,
+	["world_light_multiplier"] = 0,
 	
 	["color_brightness"] = 0,
 	["color_contrast"] = 1,
@@ -196,6 +196,7 @@ local dawn =
 tod.SetConfigCycle(
 	night, night, night, night, night, night, night, 
 	dusk, 
-	day,day,day,day,day, day, day, day, dawn, 
+	day,day,day,day,day, day, 
+	dawn, 
 	night, night
 )

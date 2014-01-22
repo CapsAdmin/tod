@@ -1,5 +1,7 @@
 tod = {}
 
+include("tod/bsp.lua")
+
 tod.Params = {}
 tod.CurrentParams = {}
 
@@ -24,7 +26,7 @@ local function GetSky()
 	return ent
 end
 	
-local function ADD_SKY_KEYVALUE(name, default, mod)
+local function ADD_SKY_KEYVALUE(name, default, mult_by_world_light)
 	if CLIENT then
 		P["sky_" .. name] = default
 	end
@@ -32,7 +34,9 @@ local function ADD_SKY_KEYVALUE(name, default, mod)
 		local type = type(default)
 		if type == "Vector" then
 			P["sky_" .. name] = function(val) 
-				if mod then val = mod(val) or val end
+				if mult_by_world_light then
+					val = val * C.world_light_multiplier
+				end
 				GetSky():SetKeyValue(name, val.x .. " " .. val.y .. " " .. val.z) 
 			end
 		elseif type == "number" then
@@ -41,12 +45,14 @@ local function ADD_SKY_KEYVALUE(name, default, mod)
 	end
 end
 
+local min = 98
+
 function tod.MultToLightEnv(mult)
-	return math.Round(math.Clamp(64+(mult * 64), 64, 127))
+	return math.Clamp(math.Round(min + (mult * min)), min, 127)
 end
 
-ADD_SKY_KEYVALUE("topcolor", Vector(0.2, 0.5, 1))
-ADD_SKY_KEYVALUE("bottomcolor", Vector(0.8, 1, 1))
+ADD_SKY_KEYVALUE("topcolor", Vector(0.2, 0.5, 1), true)
+ADD_SKY_KEYVALUE("bottomcolor", Vector(0.8, 1, 1), true)
 ADD_SKY_KEYVALUE("fadebias", 1)
 ADD_SKY_KEYVALUE("sunsize", 2)
 ADD_SKY_KEYVALUE("suncolor", Vector(0.2, 0.1, 0))
@@ -155,6 +161,104 @@ if SERVER then
 end
 
 if CLIENT then
+	do -- texture replacer
+		tod.replaced_textures = {}
+
+		function tod.ReplaceTexture(path, to)
+			path = path:lower()
+
+			local mat = Material(path)
+
+			if mat and not mat:IsError() then
+
+				local typ = type(to)
+				local tex
+
+				if typ == "string" then
+					tex = Material(to):GetTexture("$basetexture")
+				elseif typ == "ITexture" then
+					tex = to
+				elseif typ == "Material" then
+					tex = to:GetTexture("$basetexture")
+				else return false end
+
+				tod.replaced_textures[path] = tod.replaced_textures[path] or {}	
+
+				tod.replaced_textures[path].OldTexture = tod.replaced_textures[path].OldTexture or mat:GetTexture("$basetexture")
+				tod.replaced_textures[path].NewTexture = tex
+
+				mat:SetTexture("$basetexture",tex) 
+
+				return mat
+			end
+
+			return false
+		end
+			
+		function tod.SetTextureColor(path, color)
+			path = path:lower()
+
+			local mat = Material(path)
+
+			if not mat:IsError() then
+				tod.replaced_textures[path] = tod.replaced_textures[path] or {}
+				tod.replaced_textures[path].OldColor = tod.replaced_textures[path].OldColor or mat:GetVector("$color")
+				tod.replaced_textures[path].NewColor = color
+
+				mat:SetVector("$color", color)
+
+				return true
+			end
+
+			return false
+		end
+
+		function tod.RestoreAllTextures()
+			for name, tbl in pairs(tod.replaced_textures) do
+				if 
+					not pcall(function()
+						if tbl.OldTexture then
+							tod.ReplaceTexture(name, tbl.OldTexture)
+						end
+
+						if tbl.OldColor then
+							tod.SetTextureColor(name, tbl.OldColor)
+						end
+					end) 
+				then 
+					print("Failed to restore: " .. tostring(name)) 
+				end
+			end
+		end
+		hook.Add("ShutDown", "tod_texture_restore", tod.RestoreAllTextures)
+
+	end
+
+	do -- texture collector		
+		local map_data = tod.OpenBSP()
+		local found = map_data:ReadLumpTextDataStringData()
+		
+		for k,v in pairs(found) do
+			if v:find("water/") then
+				found[k] = nil
+			end
+		end
+	
+		function tod.GetMapTextures()
+			return found
+		end
+		
+		hook.Add("Think", "tod_replacetextures", function()
+			if not LocalPlayer():IsValid() then return end
+			
+			for _, tex in pairs(tod.GetMapTextures()) do
+				hook.Run("TOD_ReplaceGrassTexture", tex)
+			end
+			
+			hook.Remove("Think", "tod_replacetextures")
+		end)
+	end
+
 	local last_byte
 	
 	timer.Create("tod_update_lightmap", 0.1, 0, function()
@@ -242,11 +346,7 @@ if CLIENT then
 					end
 					timer.Create("tod_moon_sound", 0.25, 1, function()
 						LocalPlayer():SetDSP(0)
-						if _G.net then 
-							LocalPlayer():ConCommand("stopsound")
-						else
-							LocalPlayer():ConCommand("stopsounds")
-						end
+						LocalPlayer():ConCommand("stopsound")
 					end)
 				end
 			end
@@ -358,7 +458,7 @@ if CLIENT then
 		render.FogMode(1)
 		render.FogStart(C.fog_start)
 		render.FogEnd(C.fog_end)
-		render.FogColor(C.fog_color.r, C.fog_color.g, C.fog_color.b)
+		render.FogColor(C.fog_color.r * C.world_light_multiplier, C.fog_color.g * C.world_light_multiplier, C.fog_color.b * C.world_light_multiplier)
 		render.FogMaxDensity(C.fog_max_density)
 				
 		return true
@@ -366,6 +466,105 @@ if CLIENT then
 	
 	hook.Add("SetupWorldFog", "tod", SetupFog)
 	hook.Add("SetupSkyboxFog", "tod", SetupFog)
+	
+	do -- sectors (to use with snow and such)
+		-- initialize points
+		local data = {}
+		local max = 32000
+		local grid_size = 768
+		local range = max / grid_size
+
+		local pos
+
+		for x = -range, range do
+			x = x * grid_size
+			for y = -range, range do
+				y = y * grid_size
+				for z = -range, range do
+					z = z * grid_size
+					
+					pos = Vector(x,y,z)
+					local conents = util.PointContents(pos)
+					
+					if conents == CONTENTS_EMPTY or conents == CONTENTS_TESTFOGVOLUME then
+						local up = util.QuickTrace(pos, vector_up * max * 2)
+						up.HitTexture = up.HitTexture:lower()
+						if up.HitTexture == "tools/toolsskybox" or up.HitTexture == "**empty**" then
+							table.insert(data, pos)
+						end
+					end
+				end
+			end
+		end
+		
+		-- show or hide points
+		local function fastlen(point)
+			return point.x * point.x + point.y * point.y + point.z * point.z
+		end
+
+		local draw_these = {}
+		
+		local iterations = math.min(math.ceil(#data/(1/0.1)), #data)
+		local lastkey = 1
+		local lastpos = nil
+		local len = 3000 ^ 2
+		local movelen = 100 ^ 2
+		
+		local eyepos = Vector()
+		hook.Add("RenderScene", "tod_eyepos", function(pos, ang) 
+			eyepos = pos + LocalPlayer():GetVelocity() 
+		end)
+
+		local function sector_think()			
+			if lastpos == nil or fastlen(lastpos - eyepos) > movelen then
+				local c = #data
+				local r = math.min(iterations, c)
+				local completed = false
+				
+				for i = 1, r do				
+					local key = lastkey + 1
+					if key > c then
+						completed = true
+						lastkey = 1
+						break
+					end
+					
+					local point = data[key]
+					local dc = fastlen(point - eyepos) < len
+					
+					if dc and draw_these[key] == nil then
+						draw_these[key] = point
+					elseif not dc and draw_these[key] ~= nil then
+						draw_these[key] = nil
+					end
+					
+					lastkey = key
+				end
+				
+				if completed then 
+					lastpos = eyepos 
+				end
+			end
+		end
+		
+		function tod.GetOutsideSectors()
+			return draw_these
+		end
+		
+		local last
+		
+		function tod.EnableSectorThink(b)
+			if last ~= b then
+				if b then
+					timer.Create("tod_sector_think", 0.25, 0, sector_think)
+				else
+					timer.Remove("tod_sector_think")
+				end
+				last = b
+			end
+		end
+		
+	end
 	
 	-- todo!
 	-- have an inside and outside config
@@ -472,6 +671,15 @@ do
 	function tod.LerpConfigs(mult, ...)
 		return lerp(mult, {...})
 	end 
+end
+
+function tod.GetWeatherChance(probability)
+	if tod.force_weather ~= nil then return tod.force_weather end
+	probability = probability or 0.5
+	math.randomseed(math.floor(CurTime()/100))
+	local b = math.random() < probability
+	math.randomseed(RealTime())
+	return b
 end
 
 function tod.SetParameter(key, val)
@@ -584,6 +792,12 @@ function tod.SetOverrideConfig(config, lerp)
 	tod.override_lerp =  lerp
 end
 
+tod.override_configs = {}
+
+function tod.AddOverrideConfig(name, config, probability)
+	tod.override_configs[name] = {config = config, probability = probability, lerp = 0}
+end
+
 hook.Add("Think", "tod", function()
 
 	-- initialize tod
@@ -600,6 +814,22 @@ hook.Add("Think", "tod", function()
 		local fraction = (H*3600 + M*60 + S) / 86400
 
 		time = fraction%1
+	end
+	
+	for name, data in pairs(tod.override_configs) do
+		if tod.GetWeatherChance(data.probability) then 
+			data.lerp = math.min(data.lerp + FrameTime(), 1)
+			
+			tod.SetOverrideConfig(data.config, data.lerp)
+		else			
+			data.lerp = math.max(data.lerp - FrameTime(), -1)
+			
+			if data.lerp == -1 then
+				tod.SetOverrideConfig()
+			else							
+				tod.SetOverrideConfig(data.config, data.lerp)					
+			end
+		end
 	end
 	
 	-- cache lerp results
