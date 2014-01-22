@@ -1,6 +1,3 @@
-AddCSLuaFile()
-AddCSLuaFile("autorun/client/materials.lua")
-
 tod = {}
 
 tod.Params = {}
@@ -27,21 +24,28 @@ local function GetSky()
 	return ent
 end
 	
-local function ADD_SKY_KEYVALUE(name, default)
+local function ADD_SKY_KEYVALUE(name, default, mod)
 	if CLIENT then
 		P["sky_" .. name] = default
 	end
 	if SERVER then
 		local type = type(default)
 		if type == "Vector" then
-			P["sky_" .. name] = function(val) GetSky():SetKeyValue(name, val.x .. " " .. val.y .. " " .. val.z) end
+			P["sky_" .. name] = function(val) 
+				if mod then val = mod(val) or val end
+				GetSky():SetKeyValue(name, val.x .. " " .. val.y .. " " .. val.z) 
+			end
 		elseif type == "number" then
 			P["sky_" .. name] = function(val) GetSky():SetKeyValue(name, val) end
 		end
 	end
 end
 
-ADD_SKY_KEYVALUE("topcolor", Vector(0.2, 0.5, 1))--
+function tod.MultToLightEnv(mult)
+	return math.Round(math.Clamp(64+(mult * 64), 64, 127))
+end
+
+ADD_SKY_KEYVALUE("topcolor", Vector(0.2, 0.5, 1))
 ADD_SKY_KEYVALUE("bottomcolor", Vector(0.8, 1, 1))
 ADD_SKY_KEYVALUE("fadebias", 1)
 ADD_SKY_KEYVALUE("sunsize", 2)
@@ -143,12 +147,27 @@ if SERVER then
 		local ent = ents.FindByClass("light_environment")[1] or NULL
 		
 		if ent:IsValid() then
-			ent:Fire("SetPattern", string.char(math.Round(math.Clamp(64+(val * 64), 64, 127))))
+			ent:Fire("SetPattern", string.char(tod.MultToLightEnv(val)))
+		else
+			engine.LightStyle(tod.MultToLightEnv(val), 0)
 		end
 	end
 end
 
 if CLIENT then
+	local last_byte
+	
+	timer.Create("tod_update_lightmap", 0.1, 0, function()
+		local byte = tod.MultToLightEnv(tod.GetCycle())
+		
+		if last_byte ~= byte then
+			-- this function is very slow
+			render.RedownloadAllLightmaps() 
+			last_byte = byte
+		end
+	end)
+		
+	
 	do -- stars	and moon
 		tod.moon_ent = NULL
 		
@@ -428,14 +447,8 @@ do
 			if type(val) == "number" then
 				params[key] =  Lerp(mult, val, b[key] or val)
 			elseif type(val) == "Vector" then
-				if not params[key] then
-					params[key] = Vector(0,0,0)
-				end
 				params[key] = LerpVector(mult, val, b[key] or val)
 			elseif type(val) == "Angle" then
-				if not params[key] then
-					params[key] = Angle(0,0,0)
-				end
 				params[key] = LerpAngle(mult, val, b[key] or val)
 			end
 		end
@@ -478,100 +491,71 @@ function tod.SetConfig(data)
 	end
 end
 
-local last_time = 0
-
-function tod.GetCycle(scale)
-	if SERVER and tod.current_cycle and tod.current_cycle >= 0 then 
-		return tod.current_cycle 
+function tod.GetCycle()
+	if tod.mode == 2 then	
+		-- demo mode
+		return (CurTime() / (20))%1
 	end
 	
-	scale = scale or 1
-	
-	local time = tod.time or 0
-		
-	if CLIENT and time and time >= 0 then 
-		time = time / 100 
-	else
-		time = (UnPredictedCurTime() / scale)
-	end
-		
-	return time
+	return tod.current_cycle or 0
 end
 
 if CLIENT then
-	net.Receive("tod", function()
-		tod.time = net.ReadFloat()
+	net.Receive("tod_setcycle", function()
+		tod.current_cycle = net.ReadFloat() / 1000
+	end)
+	
+	net.Receive("tod_setmode", function()
+		tod.mode = net.ReadInt(4)
 	end)
 end
 
 if SERVER then
-	util.AddNetworkString("tod")
+	util.AddNetworkString("tod_setcycle")
 	
 	function tod.SetCycle(time)
 		tod.current_cycle = time and (time%1) or -1
-		net.Start("tod")
-			net.WriteFloat(time and (time * 100) or -1)
-		net.Send()
+		net.Start("tod_setcycle")
+			net.WriteFloat(tod.current_cycle * 1000)
+		net.Send(player.GetAll())
+	end
+	
+	util.AddNetworkString("tod_setmode")
+
+	function tod.SetMode(mode, filter)
+		tod.mode = mode
+		net.Start("tod_setmode")
+			net.WriteInt(tod.mode, 4)
+		net.Send(filter or player.GetAll())
 	end
 end
 
-if CLIENT then
-	function tod.SetNWParameter(key, val)
-		tod.SetParameter(key, val)
-		RunConsoleCommand("set_tod_param", glon.encode({key, val})) -- lol
-	end
-	
-	usermessage.Hook("set_tod_param", function(umr)
-		local key, val = unpack(glon.decode(umr:ReadString())) -- lol
-		if key and val then
-			tod.SetParameter(key, val)
-		end
-	end)
-end
+tod.cvar = CreateConVar("sv_tod", "1", bit.bor(FCVAR_REPLICATED, FCVAR_NOTIFY),
+	"0 = off\1 = realtime\n2 = demo"
+)
 
 if SERVER then
-	function tod.SetNWParameter(key, val)
-		tod.SetParameter(key, val)
-		umsg.Start("set_tod_param")
-			umsg.String(glon.encode{key, val}) -- lol
-		umsg.End()
-	end
-	
-	concommand.Add("set_tod_param", function(ply, _, args)
-		if ply:IsAdmin() then
-			local key, val = unpack(glon.decode(args[1])) -- lol
-			
-			if key and val then
-				tod.SetNWParameter(key, val)
-			end
-		end
-	end)
-end
-	
-if SERVER then
-	local enable = CreateConVar("sv_tod", "1", {FCVAR_ARCHIVE, FCVAR_NOTIFY, FCVAR_GAMEDLL})
-
 	local function cmd(val)
-		if val == "demo" then
-			game.ConsoleCommand("sv_tod 0\n")
-			tod.SetCycle()
-		else
-			local daytime = tonumber(val)
-			
-			if daytime then
-				game.ConsoleCommand("sv_tod 0\n")
-				tod.SetCycle((daytime / 24)%1)
-			else
-				game.ConsoleCommand("sv_tod 1\n")
-				tod.SetCycle()
-			end
+		local time24 = tonumber(val)
+		
+		if time24 then
+			RunConsoleCommand("sv_tod", "0")
+			tod.SetCycle((time24 / 24)%1)
+		elseif val == "demo" then
+			RunConsoleCommand("sv_tod", "2")
+		elseif val == "realtime" or time24 < 0 then
+			RunConsoleCommand("sv_tod", "1")
 		end
+		
+		timer.Simple(0.1, function()
+			tod.SetMode(tod.cvar:GetInt())
+		end)
 	end
 	
 	if aowl then
 		aowl.AddCommand("settod", function(player, line, val)
 			cmd(val)
-		end, "moderators")
+		end, "admin")
 	else
 		concommand.Add("settod", function(ply, _, args)
 			if ply:IsAdmin() then
@@ -580,215 +564,48 @@ if SERVER then
 		end)
 	end
 	
-	timer.Create("real_time_tod", 1, 0, function()
-		if not enable:GetBool() then return end
-		
-		local H, M, S = os.date("%H"), os.date("%M"), os.date("%S")
-		local fraction = (H*3600 + M*60 + S) / 86400
-
-		tod.SetCycle(fraction%1)
+	hook.Add("PlayerInitialSpawn", "tod_mode", function(ply)
+		if not ply or not ply:IsValid() then return end
+				
+		tod.SetMode(tod.cvar:GetInt(), ply)
 	end)
 end
 
--- finally, the actual config
-
-local night = 
-{	
-	["sun_angles"] = Angle(-90, 45, 0),
-	["moon_angles"] = -Angle(-90, 45, 0),
-	["world_light_multiplier"] = 0.53,
-	
-	["color_brightness"] = 0,
-	["color_contrast"] = 1,
-	["color_saturation"] = 0.75,
-	["color_multiply"] = Vector(-0.017, -0.005, 0.02),
-	["color_add"] = Vector(0, 0, 0),
-	
-	["fog_start"] = 0,
-	["fog_end"] = 14000,
-	["fog_max_density"] = 0.25,
-	["fog_color"] = Vector(0.25, 0.20, 0.30),
-	
-	["shadow_angles"] = Angle(-90, 45, 0),
-	["shadow_color"] = Vector(0, 0, 0),
-	
-	["star_intensity"] = 1,
-	
-	["bloom_passes"] = 1,
-	["bloom_color"] = Vector(1, 1, 1),
-	["bloom_width"] = 1,
-	["bloom_saturation"] = 1,
-	["bloom_height"] = 1,
-	["bloom_darken"] = 0,
-	["bloom_multiply"] = 0,
-	
-	["sharpen_contrast"] = 0,
-	["sharpen_distance"] = 0,
-	
-	["sky_topcolor"] = Vector(0, 0, 0),
-	["sky_bottomcolor"] = Vector(0, 0, 0),
-	["sky_fadebias"] = 1,
-	["sky_sunsize"] = 0,
-	["sky_sunnormal"] = Vector(0.4, 0, 0.01),
-	["sky_suncolor"] = Vector(0.2, 0.1, 0),
-	["sky_duskscale"] = 1,
-	["sky_duskintensity"] = 1,
-	["sky_duskcolor"] = Vector(0, 0, 0),
-	["sky_starscale"] = 0.5,
-	["sky_starfade"] = 10,
-	["sky_starspeed"] = 0.01,
-	["sky_hdrscale"] = 0.66,
-}
-
-local dusk = 
-{
-	["sun_angles"] = Angle(0, 45, 0),
-	["moon_angles"] = -Angle(0, 45, 0),
-	["world_light_multiplier"] = 0.53,
-	
-	["color_brightness"] = 0,
-	["color_contrast"] = 1,
-	["color_saturation"] = 1.1,
-	["color_multiply"] = Vector(0.017, 0.005, -0.02),
-	["color_add"] = Vector(0, 0, 0),
-	
-	["fog_start"] = 0,
-	["fog_end"] = 10000,
-	["fog_max_density"] = 1,
-	["fog_color"] = Vector(1, 0.85, 0.6), 
-	
-	["shadow_angles"] = Angle(0, 45, 0),
-	["shadow_color"] = Vector(0, 0, 0),
-	
-	["star_intensity"] = 0,
-	
-	["bloom_passes"] = 3,
-	["bloom_color"] = Vector(1, 1, 1),
-	["bloom_width"] = 5,
-	["bloom_height"] = 5,
-	["bloom_saturation"] = 0.25,
-	["bloom_darken"] = 1,
-	["bloom_multiply"] = 0,
-	
-	["sharpen_contrast"] = 0,
-	["sharpen_distance"] = 0,
-	
-	["sky_topcolor"] = Vector(1, 1, 1),
-	["sky_bottomcolor"] = Vector(1, 1, 1)*0,
-	["sky_fadebias"] = 1,
-	["sky_sunsize"] = 2,
-	["sky_sunnormal"] = Vector(0, 0, 0),
-	["sky_suncolor"] = Vector(0.5, 0.1, 0),
-	["sky_duskscale"] = 7,
-	["sky_duskintensity"] = 5,
-	["sky_duskcolor"] = Vector(1, 0.2, 0),
-	["sky_starscale"] = 0.5,
-	["sky_starfade"] = 1,
-	["sky_starspeed"] = 0.01,
-	["sky_hdrscale"] = 0.66,
-}
-
-local day = 
-{
-	["sun_angles"] = Angle(90, 45, 0),
-	["moon_angles"] = -Angle(90, 45, 0),
-	["world_light_multiplier"] = 1,
-	
-	["color_brightness"] = 0,
-	["color_contrast"] = 1,
-	["color_saturation"] = 1,
-	["color_multiply"] = Vector(0,0,0),
-	["color_add"] = Vector(0, 0, 0),
-	
-	["fog_start"] = 0,
-	["fog_end"] = 30000,
-	["fog_max_density"] = -1,
-	["fog_color"] = Vector(1,1,1), 
-	
-	["shadow_angles"] = Angle(0, 45, 0),
-	["shadow_color"] = Vector(0, 0, 0),
-	
-	["star_intensity"] = 0,
-	
-	["bloom_passes"] = 3,
-	["bloom_color"] = Vector(1, 1, 1),
-	["bloom_width"] = 5,
-	["bloom_height"] = 5,
-	["bloom_saturation"] = 0.25,
-	["bloom_darken"] = 1,
-	["bloom_multiply"] = 0,
-	
-	["sharpen_contrast"] = 0,
-	["sharpen_distance"] = 0,
-	
-	["sky_topcolor"] = Vector(0.125, 0.5, 1),
-	["sky_bottomcolor"] = Vector(0.8, 1, 1),
-	["sky_fadebias"] = 0.25,
-	["sky_sunsize"] = 1,
-	["sky_sunnormal"] = Vector(0, 0, 0),
-	["sky_suncolor"] = Vector(0.2, 0.1, 0),
-	["sky_duskscale"] = 0,
-	["sky_duskintensity"] = -1,
-	["sky_duskcolor"] = Vector(1, 0.2, 0),
-	["sky_starscale"] = 0.5,
-	["sky_starfade"] = 1,
-	["sky_starspeed"] = 0.01,
-	["sky_hdrscale"] = 0.66,
-}
-
-local dawn = 
-{
-	["sun_angles"] = Angle(90*2, 45, 0),
-	["moon_angles"] = -Angle(90*2, 45, 0),
-	["world_light_multiplier"] = 0.53,
-	
-	["color_brightness"] = 0,
-	["color_contrast"] = 1,
-	["color_saturation"] = 0.9,
-	["color_multiply"] = Vector(0.017, -0.075, 0.01),
-	["color_add"] = Vector(0, 0, 0),
-	
-	["fog_start"] = 0,
-	["fog_end"] = 10000,
-	["fog_max_density"] = -1,
-	["fog_color"] = Vector(1,1,1), 
-	
-	["shadow_angles"] = Angle(0, 45, 0),
-	["shadow_color"] = Vector(0, 0, 0),
-	
-	["star_intensity"] = 0,
-	
-	["bloom_passes"] = 3,
-	["bloom_color"] = Vector(1, 1, 1),
-	["bloom_width"] = 5,
-	["bloom_height"] = 5,
-	["bloom_saturation"] = 0.25,
-	["bloom_darken"] = 1,
-	["bloom_multiply"] = 0,
-	
-	["sharpen_contrast"] = 0,
-	["sharpen_distance"] = 0,
-	
-	["sky_topcolor"] = Vector(1, 0.25, 1) * 0.25,
-	["sky_bottomcolor"] = Vector(1, 0.5, 0.25),
-	["sky_fadebias"] = 0,
-	["sky_sunsize"] = 1,
-	["sky_sunnormal"] = Vector(0, 0, 0),
-	["sky_suncolor"] = Vector(0.2, 0.1, 0),
-	["sky_duskscale"] = 2,
-	["sky_duskintensity"] = 5,
-	["sky_duskcolor"] = Vector(1, 0.1, 0.5),
-	["sky_starscale"] = 0.5,
-	["sky_starfade"] = 100,
-	["sky_starspeed"] = 0.01,
-	["sky_hdrscale"] = 0.66,
-}
-
 local cache = {}
-local last_time
 
-timer.Create("tod", 0.1, 0, function()
-	local time = math.Round(tod.GetCycle(20), 3)
+function tod.SetConfigCycle(...)
+	cache = {}
+	tod.config_cycle = {...}
+end
+
+function tod.SetOverrideConfig(config, lerp)
+	cache = {}
+	tod.override_config = config
+	tod.override_lerp =  lerp
+end
+
+hook.Add("Think", "tod", function()
+
+	-- initialize tod
+	if SERVER and not tod.mode then
+		tod.SetMode(tod.cvar:GetInt())
+	end
+		
+	local time
+
+	if not tod.mode or tod.mode == 0 or tod.mode == 2 then -- manual
+		time = tod.GetCycle()
+	elseif tod.mode == 1 then -- realtime
+		local H, M, S = os.date("%H"), os.date("%M"), os.date("%S")
+		local fraction = (H*3600 + M*60 + S) / 86400
+
+		time = fraction%1
+	end
+	
+	-- cache lerp results
+	-- good for realtime
+	time = math.Round(time, 3)
+	
 	local cfg
 	
 	if cache[time] then
@@ -797,29 +614,33 @@ timer.Create("tod", 0.1, 0, function()
 		cfg = tod.LerpConfigs(
 			time, 
 			
-			night,night,night,night,night,night,night, -- hacky (or is it?) way to make the night last longer
-			dusk, 
-			day,day,day,day,day,day,day,day, 
-			dawn
+			unpack(tod.config_cycle)
 		)
-		cache[time] = cfg
-	end
-	
-	if CLIENT then
-		if last_time ~= time then	
-			render.RedownloadAllLightmaps()
-			last_time = time
+		
+		-- for snow and such
+		if tod.override_config then
+			cfg = tod.LerpConfigs(tod.override_lerp, cfg, tod.override_config)
 		end
+		
+		cache[time] = cfg
 	end
 	
 	tod.SetConfig(cfg)	
 end)
 
+include("tod/default_cycle.lua")
+
+if SERVER then
+	AddCSLuaFile("tod/default_cycle.lua")
+end
+
 do -- weather
 	local month = tonumber(os.date("%m")) or -1
 
 	if month >= 11 or month <= 2 then
-		include("tod_weather/snow.lua")
-		AddCSLuaFile("tod_weather/snow.lua")
+		include("tod/snow.lua")
+		if SERVER then 
+			AddCSLuaFile("tod/snow.lua")
+		end
 	end
 end
