@@ -155,7 +155,8 @@ if SERVER then
 		if ent:IsValid() then
 			ent:Fire("SetPattern", string.char(tod.MultToLightEnv(val)))
 		else
-			engine.LightStyle(tod.MultToLightEnv(val), 0)
+		--	engine.LightStyle(tod.MultToLightEnv(val), 0)
+			engine.LightStyle(0, tod.MultToLightEnv(val)) -- You just made a mistake with the parameters
 		end
 	end
 end
