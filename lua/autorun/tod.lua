@@ -739,7 +739,7 @@ if SERVER then
 end
 
 tod.cvar = CreateConVar("sv_tod", "1", bit.bor(FCVAR_REPLICATED, FCVAR_NOTIFY),
-	"0 = off\1 = realtime\n2 = demo"
+	"0 = off\n1 = realtime\n2 = demo"
 )
 
 if SERVER then
